@@ -1,9 +1,28 @@
+/* eslint-disable no-await-in-loop */
 const url = require('url');
+const log4js = require('log4js');
+const recording = require('log4js/lib/appenders/recording');
+
+log4js.configure({
+  appenders: {
+    vcr: {
+      type: 'recording',
+    },
+    out: {
+      type: 'console',
+    },
+  },
+  categories: { default: { appenders: ['vcr', 'out'], level: 'info' } },
+});
+
+const logger = log4js.getLogger();
 const JSEncrypt = require('node-jsencrypt');
 // process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
 const superagent = require('superagent');
 const config = require('../config');
 const accounts = require('../accounts');
+const serverChan = require('../serverChan');
+const telegramBot = require('../telegramBot');
 
 const client = superagent.agent();
 const headers = {
@@ -147,7 +166,6 @@ const doGet = (taskUrl) => new Promise((resolve, reject) => {
     })
     .end((err, res) => {
       if (err) {
-        console.error(err);
         reject(err);
         return;
       }
@@ -158,12 +176,16 @@ const doGet = (taskUrl) => new Promise((resolve, reject) => {
 const mask = (s, start, end) => s.split('').fill('*', start, end).join('');
 
 // 登录流程 1.获取公钥 -> 2.获取登录参数 -> 3.获取登录地址,跳转到登录页
-const doLogin = async (userName, password) => {
-  const encryptKey = await getEncrypt();
-  const formData = await getLoginFormData(userName, password, encryptKey);
-  const loginResult = await login(formData);
-  return [encryptKey, formData, loginResult];
-};
+const doLogin = (userName, password) => new Promise((resolve, reject) => {
+  getEncrypt()
+    .then((encryptKey) => getLoginFormData(userName, password, encryptKey))
+    .then((formData) => login(formData))
+    .then(() => resolve('登录成功'))
+    .catch((error) => {
+      logger.error(`登录失败:${JSON.stringify(error)}`);
+      reject(error);
+    });
+});
 
 // 任务 1.签到 2.天天抽红包 3.自动备份抽红包
 const doTask = async () => {
@@ -171,12 +193,12 @@ const doTask = async () => {
     `https://cloud.189.cn/mkt/userSign.action?rand=${new Date().getTime()}&clientType=TELEANDROID&version=${config.version}&model=${config.model}`,
     'https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action?taskId=TASK_SIGNIN&activityId=ACT_SIGNIN',
     'https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action?taskId=TASK_SIGNIN_PHOTOS&activityId=ACT_SIGNIN',
+    'https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action?taskId=TASK_2022_FLDFS_KJ&activityId=ACT_SIGNIN',
   ];
 
   const result = [];
   for (let index = 0; index < tasks.length; index += 1) {
     const task = tasks[index];
-    // eslint-disable-next-line no-await-in-loop
     const res = await doGet(task);
     if (index === 0) {
       // 签到
@@ -190,21 +212,88 @@ const doTask = async () => {
   return result;
 };
 
-// 开始执行程序
-accounts.forEach(async (account) => {
-  const { userName, password } = account;
-  if (userName && password) {
-    const userNameInfo = mask(userName, 3, 7);
-    await doLogin(userName, password).then(() => {
-      console.log(`--${userNameInfo} 登录成功开始执行任务--`);
-      doTask().then((result) => {
-        result.forEach((r) => console.log(r));
-        console.log(`--${userNameInfo}任务执行完毕--`);
-      }).catch((e) => {
-        console.error(`--${userNameInfo}任务执行失败:${JSON.stringify(e)}--`);
-      });
-    }).catch((e) => {
-      console.error(`--${userNameInfo} 登录失败:${JSON.stringify(e)}--`);
+const pushServerChan = (title, desp) => {
+  if (!serverChan.sendKey) { return; }
+  const data = {
+    title,
+    desp,
+  };
+  superagent.post(`https://sctapi.ftqq.com/${serverChan.sendKey}.send`)
+    .type('form')
+    .send(data)
+    .end((err, res) => {
+      if (err) {
+        logger.error(`ServerChan推送失败:${JSON.stringify(err)}`);
+        return;
+      }
+      const json = JSON.parse(res.text);
+      if (json.code !== 0) {
+        logger.error(`ServerChan推送失败:${JSON.stringify(json)}`);
+      } else {
+        logger.info('ServerChan推送成功');
+      }
     });
+};
+
+const pushTelegramBot = (title, desp) => {
+  if (!(telegramBot.botToken && telegramBot.chatId)) { return; }
+  const data = {
+    chat_id: telegramBot.chatId,
+    text: title + "\n\n" + desp,
+  };
+  superagent.post(`https://api.telegram.org/bot${telegramBot.botToken}/sendMessage`)
+    .type('form')
+    .send(data)
+    .end((err, res) => {
+      if (err) {
+        logger.error(`TelegramBot推送失败:${JSON.stringify(err)}`);
+        return;
+      }
+      const json = JSON.parse(res.text);
+      if (!json.ok) {
+        logger.error(`TelegramBot推送失败:${JSON.stringify(json)}`);
+      } else {
+        logger.info('TelegramBot推送成功');
+      }
+    });
+};
+
+const push = (title, desp) => {
+  pushServerChan(title, desp);
+  pushTelegramBot(title, desp);
+}
+
+// 开始执行程序
+async function main() {
+  for (let index = 0; index < accounts.length; index += 1) {
+    const account = accounts[index];
+    const { userName, password } = account;
+    if (userName && password) {
+      const userNameInfo = mask(userName, 3, 7);
+      try {
+        logger.log(`账户 ${userNameInfo}开始执行`);
+        await doLogin(userName, password);
+        const result = await doTask();
+        result.forEach((r) => logger.log(r));
+        logger.log('任务执行完毕');
+      } catch (e) {
+        if (e.code === 'ECONNRESET') {
+          throw e;
+        }
+      } finally {
+        logger.log(`账户 ${userNameInfo}执行完毕`);
+      }
+    }
   }
-});
+}
+
+(async () => {
+  try {
+    await main();
+  } finally {
+    const events = recording.replay();
+    const content = events.map((e) => `${e.data.join('')}`).join('  \n');
+    push('天翼云盘自动签到任务', content);
+    recording.erase();
+  }
+})();
